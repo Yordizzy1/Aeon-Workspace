@@ -1,12 +1,18 @@
 from flask import Flask, request, jsonify
+import os
 import yaml
+import stripe
+
 from billing_adapter import BillingAdapter
 
+
 app = Flask(__name__)
+
 
 # Load pricing configuration
 with open("pricing.yaml", "r") as f:
     pricing = yaml.safe_load(f)
+
 
 billing = BillingAdapter(pricing)
 
@@ -87,7 +93,6 @@ def home():
       </head>
 
       <body>
-
         <h1>Aeon</h1>
 
         <h2>Agent Output Anomaly Detector</h2>
@@ -134,15 +139,12 @@ def home():
         </p>
 
         <div class="status">
-
           <h3>Service Status</h3>
 
           <p>
             <a href="/health">Check service health</a>
           </p>
-
         </div>
-
       </body>
     </html>
     """
@@ -208,6 +210,75 @@ def usage():
         "customer_id": customer_id,
         "balance_usd": balance,
     })
+
+
+@app.route("/stripe/webhook", methods=["POST"])
+def stripe_webhook():
+    webhook_secret = os.environ.get(
+        "STRIPE_WEBHOOK_SECRET"
+    )
+
+    if not webhook_secret:
+        return jsonify({
+            "error": "webhook_secret_not_configured",
+        }), 503
+
+    payload = request.get_data()
+
+    signature = request.headers.get(
+        "Stripe-Signature",
+        "",
+    )
+
+    try:
+        event = stripe.Webhook.construct_event(
+            payload,
+            signature,
+            webhook_secret,
+        )
+
+    except ValueError:
+        return jsonify({
+            "error": "invalid_payload",
+        }), 400
+
+    except stripe.error.SignatureVerificationError:
+        return jsonify({
+            "error": "invalid_signature",
+        }), 400
+
+    event_type = event.get(
+        "type",
+        "",
+    )
+
+    if event_type == "checkout.session.completed":
+        session = event["data"]["object"]
+
+        print(
+            "Stripe checkout completed:",
+            session.get("id"),
+        )
+
+    elif event_type == "checkout.session.async_payment_succeeded":
+        session = event["data"]["object"]
+
+        print(
+            "Stripe async payment succeeded:",
+            session.get("id"),
+        )
+
+    elif event_type == "checkout.session.async_payment_failed":
+        session = event["data"]["object"]
+
+        print(
+            "Stripe async payment failed:",
+            session.get("id"),
+        )
+
+    return jsonify({
+        "received": True,
+    }), 200
 
 
 @app.errorhandler(404)
