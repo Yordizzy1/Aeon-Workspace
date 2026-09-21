@@ -75,3 +75,31 @@ def home():
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080)
+@app.route('/')
+def home():
+    return """
+    <!doctype html>
+    <html>
+      <head>
+        <title>Aeon — Agent Output Anomaly Detector</title>
+      </head>
+      <body>
+        <h1>Aeon</h1>
+        <h2>Agent Output Anomaly Detector</h2>
+
+        <p>
+          Aeon provides a machine-facing API for detecting anomalies
+          in AI-agent outputs.
+        </p>
+
+        <h3>Pricing</h3>
+        <p>$0.003 per detection event.</p>
+
+        <h3>API</h3>
+        <p>POST /detect</p>
+
+        <h3>Service status</h3>
+        <p><a href="/health">Health check</a></p>
+      </body>
+    </html>
+    """
