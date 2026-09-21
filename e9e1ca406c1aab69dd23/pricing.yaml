@@ -1,0 +1,11 @@
+unit_price: 0.003
+billing_unit: event
+free_tier:
+  events_per_month: 1000
+volume_tiers:
+  - min_events: 1001
+    max_events: 10000
+    discount: 0.1
+  - min_events: 10001
+    max_events: null
+    discount: 0.2

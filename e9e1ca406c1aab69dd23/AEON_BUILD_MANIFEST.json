@@ -1,0 +1,20 @@
+{
+  "bytes": 6719,
+  "file_count": 10,
+  "files": [
+    "app.py",
+    "billing_adapter.py",
+    "pricing.yaml",
+    "test_billing.py",
+    "requirements.txt",
+    "run.sh",
+    "launch_runbook.md",
+    "README.md",
+    "AEON_BUILD_MANIFEST.json",
+    "REVIEW.md"
+  ],
+  "generated_at_unix": 1789966741.3232307,
+  "opportunity_id": "business-ai-37407686e4df1a05c6",
+  "schema": "aeon.autonomous_business_build.v1",
+  "truth_semantics": "LOCAL_BUILD_ARTIFACTS_ONLY; NOT DEPLOYED; NO CUSTOMER_OR_REVENUE CLAIM"
+}
