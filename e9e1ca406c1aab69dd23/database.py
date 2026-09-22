@@ -425,3 +425,121 @@ def get_usage_summary(api_key):
         if isinstance(exc, DatabaseError):
             raise
         raise DatabaseError(str(exc)) from exc
+
+
+
+def get_public_business_metrics():
+    """Return aggregate billing telemetry without PII or credential material."""
+
+    def _mode_metrics(cur, livemode):
+        cur.execute(
+            """
+            SELECT
+                COUNT(*) AS paid_checkouts,
+                COUNT(
+                    DISTINCT COALESCE(
+                        NULLIF(LOWER(email), ''),
+                        stripe_session_id
+                    )
+                ) AS paid_customers,
+                COALESCE(SUM(amount_total), 0) AS paid_cents,
+                COALESCE(SUM(credits), 0) AS credits_sold,
+                COALESCE(
+                    SUM(CASE WHEN claimed THEN 1 ELSE 0 END),
+                    0
+                ) AS claimed_purchases,
+                MAX(updated_at) AS last_payment_at
+            FROM purchases
+            WHERE livemode = %s
+              AND payment_status = 'paid'
+            """,
+            (livemode,),
+        )
+        purchases = cur.fetchone()
+
+        cur.execute(
+            """
+            SELECT amount_total
+            FROM purchases
+            WHERE livemode = %s
+              AND payment_status = 'paid'
+            ORDER BY updated_at DESC, id DESC
+            LIMIT 1
+            """,
+            (livemode,),
+        )
+        last_purchase = cur.fetchone()
+
+        cur.execute(
+            """
+            SELECT
+                COUNT(*) AS customer_records,
+                COALESCE(SUM(credit_balance), 0) AS credits_remaining
+            FROM customers
+            WHERE livemode = %s
+            """,
+            (livemode,),
+        )
+        customers = cur.fetchone()
+
+        cur.execute(
+            """
+            SELECT COUNT(*) AS api_calls
+            FROM usage_events AS usage
+            JOIN customers
+              ON customers.id = usage.customer_id
+            WHERE customers.livemode = %s
+            """,
+            (livemode,),
+        )
+        usage = cur.fetchone()
+
+        cur.execute(
+            """
+            SELECT COUNT(*) AS active_api_keys
+            FROM api_keys
+            JOIN customers
+              ON customers.id = api_keys.customer_id
+            WHERE customers.livemode = %s
+              AND api_keys.revoked_at IS NULL
+            """,
+            (livemode,),
+        )
+        keys = cur.fetchone()
+
+        paid_cents = int(purchases['paid_cents'] or 0)
+        last_payment_at = purchases['last_payment_at']
+
+        return {
+            'paid_checkouts': int(purchases['paid_checkouts'] or 0),
+            'paid_customers': int(purchases['paid_customers'] or 0),
+            'gross_paid_cents': paid_cents,
+            'gross_paid_usd': round(paid_cents / 100.0, 2),
+            'credits_sold': int(purchases['credits_sold'] or 0),
+            'claimed_purchases': int(purchases['claimed_purchases'] or 0),
+            'customer_records': int(customers['customer_records'] or 0),
+            'credits_remaining': int(customers['credits_remaining'] or 0),
+            'api_calls_consumed': int(usage['api_calls'] or 0),
+            'active_api_keys': int(keys['active_api_keys'] or 0),
+            'last_payment_at': (
+                last_payment_at.isoformat()
+                if last_payment_at is not None
+                else None
+            ),
+            'last_payment_usd': (
+                round(int(last_purchase['amount_total']) / 100.0, 2)
+                if last_purchase is not None
+                else None
+            ),
+        }
+
+    try:
+        with _connect() as conn:
+            with conn.cursor() as cur:
+                live = _mode_metrics(cur, True)
+                test = _mode_metrics(cur, False)
+        return {'live': live, 'test': test}
+    except Exception as exc:
+        if isinstance(exc, DatabaseError):
+            raise
+        raise DatabaseError(str(exc)) from exc

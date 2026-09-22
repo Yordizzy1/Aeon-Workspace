@@ -1,5 +1,6 @@
 from flask import Flask, request, jsonify, Response
 from decimal import Decimal, ROUND_FLOOR
+from datetime import datetime, timezone
 import html
 import os
 
@@ -13,6 +14,7 @@ from database import (
     PurchaseNotReady,
     claim_purchase,
     db_health,
+    get_public_business_metrics,
     init_db,
     process_stripe_event,
 )
@@ -121,6 +123,62 @@ def health():
         "service": "Aeon Agent Output Anomaly Detector",
         "database": detail,
     }), 200 if healthy else 503
+
+
+@app.route("/aeon/metrics")
+def aeon_metrics():
+    """Aggregate operational telemetry for the local AEON owner dashboard.
+
+    No emails, API keys, Stripe secrets, database credentials, Checkout Session
+    IDs, or customer-level records are returned. Test and live data stay separate.
+    """
+    healthy, detail = db_health()
+    if not healthy:
+        return jsonify({
+            "schema": "aeon.business_metrics.v1",
+            "status": "degraded",
+            "service": "Aeon Agent Output Anomaly Detector",
+            "database": detail,
+            "as_of": datetime.now(timezone.utc).isoformat(),
+            "live": {},
+            "test": {},
+            "truth_semantics": (
+                "DATABASE_UNAVAILABLE; NO_REVENUE_ASSUMED; "
+                "NO_CUSTOMER_OR_CREDENTIAL_DATA_EXPOSED"
+            ),
+        }), 200
+
+    try:
+        metrics = get_public_business_metrics()
+    except DatabaseError:
+        return jsonify({
+            "schema": "aeon.business_metrics.v1",
+            "status": "degraded",
+            "service": "Aeon Agent Output Anomaly Detector",
+            "database": "metrics_query_failed",
+            "as_of": datetime.now(timezone.utc).isoformat(),
+            "live": {},
+            "test": {},
+            "truth_semantics": (
+                "METRICS_QUERY_FAILED; NO_REVENUE_ASSUMED; "
+                "NO_CUSTOMER_OR_CREDENTIAL_DATA_EXPOSED"
+            ),
+        }), 200
+
+    return jsonify({
+        "schema": "aeon.business_metrics.v1",
+        "status": "healthy",
+        "service": "Aeon Agent Output Anomaly Detector",
+        "database": "ok",
+        "as_of": datetime.now(timezone.utc).isoformat(),
+        "live": metrics["live"],
+        "test": metrics["test"],
+        "truth_semantics": (
+            "LIVE_GROSS_IS_SUM_OF_STRIPE_SIGNED_PAID_CHECKOUTS_RECORDED_IN_POSTGRES; "
+            "SANDBOX_EXCLUDED_FROM_LIVE; PAID_DOES_NOT_BY_ITSELF_PROVE_BANK_PAYOUT_OR_SPENDABLE_SETTLEMENT; "
+            "NO_CUSTOMER_OR_CREDENTIAL_DATA_EXPOSED"
+        ),
+    }), 200
 
 
 @app.route("/detect", methods=["POST"])
