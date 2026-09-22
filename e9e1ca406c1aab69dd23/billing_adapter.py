@@ -1,24 +1,41 @@
+from database import consume_credit, get_purchase_status, get_usage_summary
+
+
+class InvalidApiKey(RuntimeError):
+    pass
+
+
+class InsufficientCredits(RuntimeError):
+    pass
+
+
+class EventIdConflict(RuntimeError):
+    pass
+
+
 class BillingAdapter:
-    def __init__(self, pricing_config):
-        self.pricing = pricing_config
-        self.balances = {}
-        self.charges = {}
+    InvalidApiKey = InvalidApiKey
+    InsufficientCredits = InsufficientCredits
+    EventIdConflict = EventIdConflict
 
-    def charge(self, customer_id, event_id, result):
-        unit_price = self.pricing.get("unit_price", 0.003)
-        amount = unit_price
+    def consume(self, *, api_key, event_id=None):
+        result = consume_credit(api_key, event_id)
+        status = result.get("status")
 
-        if event_id and event_id in self.charges:
-            return self.charges[event_id]
+        if status == "invalid_api_key":
+            raise InvalidApiKey()
+        if status == "insufficient_credits":
+            raise InsufficientCredits()
+        if status == "event_id_conflict":
+            raise EventIdConflict()
 
-        if event_id:
-            self.charges[event_id] = amount
+        return result
 
-        self.balances[customer_id] = (
-            self.balances.get(customer_id, 0.0) + amount
-        )
+    def usage(self, api_key):
+        result = get_usage_summary(api_key)
+        if result.get("status") == "invalid_api_key":
+            raise InvalidApiKey()
+        return result
 
-        return amount
-
-    def get_balance(self, customer_id):
-        return self.balances.get(customer_id, 0.0)
+    def purchase_status(self, session_id):
+        return get_purchase_status(session_id)
