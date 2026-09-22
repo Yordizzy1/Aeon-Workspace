@@ -1,0 +1,60 @@
+{
+  "info": {
+    "name": "Aeon Agent Output Anomaly Detector",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "description": "Deterministic guardrail API for AI-agent outputs."
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "https://aeon-workspace.onrender.com"
+    },
+    {
+      "key": "apiKey",
+      "value": "YOUR_AEON_API_KEY"
+    }
+  ],
+  "item": [
+    {
+      "name": "Health",
+      "request": {
+        "method": "GET",
+        "url": "{{baseUrl}}/health"
+      }
+    },
+    {
+      "name": "Detect anomaly",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{apiKey}}"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\"output\":\"Hello world\",\"event_id\":\"postman-001\"}"
+        },
+        "url": "{{baseUrl}}/detect"
+      }
+    },
+    {
+      "name": "Usage",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{apiKey}}"
+          }
+        ],
+        "url": "{{baseUrl}}/usage"
+      }
+    }
+  ]
+}

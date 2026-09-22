@@ -1,11 +1,14 @@
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify, Response, make_response, redirect
 from decimal import Decimal, ROUND_FLOOR
 from datetime import datetime, timezone
 import html
+import json
 import os
+import re
 
 import stripe
 import yaml
+from urllib.parse import urlparse
 
 from billing_adapter import BillingAdapter
 from database import (
@@ -15,6 +18,10 @@ from database import (
     claim_purchase,
     db_health,
     get_public_business_metrics,
+    get_acquisition_metrics,
+    attribute_purchase_source,
+    record_acquisition_event,
+    ensure_acquisition_schema,
     init_db,
     process_stripe_event,
 )
@@ -29,9 +36,81 @@ PAYMENT_LINK_URL = os.environ.get("PAYMENT_LINK_URL", "").strip()
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "").strip()
 STRIPE_WEBHOOK_SECRET_TEST = os.environ.get("STRIPE_WEBHOOK_SECRET_TEST", "").strip()
 STRIPE_WEBHOOK_SECRET_LIVE = os.environ.get("STRIPE_WEBHOOK_SECRET_LIVE", "").strip()
+PUBLIC_BASE_URL = os.environ.get(
+    "PUBLIC_BASE_URL", "https://aeon-workspace.onrender.com"
+).strip().rstrip("/")
+INDEXNOW_KEY = "ebc79b0ab2b9072a00d8e592f9aad85c"
+ACQUISITION_COOKIE = "aeon_acquisition_source"
+_SOURCE_RE = re.compile(r"[^a-z0-9_-]+")
+_BOT_RE = re.compile(
+    r"bot|crawler|spider|slurp|preview|headless|wget|curl|python-requests|"
+    r"facebookexternalhit|linkedinbot|twitterbot|bingpreview|googlebot",
+    re.IGNORECASE,
+)
 
 billing = BillingAdapter()
 init_db()
+ensure_acquisition_schema()
+
+
+
+def normalize_acquisition_source(value):
+    value = str(value or '').strip().lower()[:80]
+    value = _SOURCE_RE.sub('-', value).strip('-_')
+    return value[:64] or 'direct'
+
+
+def is_probable_bot():
+    return bool(_BOT_RE.search(str(request.headers.get('User-Agent') or '')))
+
+
+def referrer_source():
+    explicit = request.args.get('src')
+    if explicit:
+        return normalize_acquisition_source(explicit)
+    cookie = request.cookies.get(ACQUISITION_COOKIE)
+    if cookie:
+        return normalize_acquisition_source(cookie)
+    ref = str(request.referrer or '').strip()
+    if not ref:
+        return 'direct'
+    try:
+        host = (urlparse(ref).hostname or '').lower()
+    except ValueError:
+        return 'other'
+    if 'google.' in host:
+        return 'google'
+    if host.endswith('bing.com'):
+        return 'bing'
+    if host.endswith('github.com'):
+        return 'github'
+    if host.endswith('postman.com'):
+        return 'postman'
+    if host.endswith('producthunt.com'):
+        return 'producthunt'
+    if host.endswith('news.ycombinator.com'):
+        return 'showhn'
+    return 'referral'
+
+
+def set_source_cookie(response, source):
+    response.set_cookie(
+        ACQUISITION_COOKIE,
+        normalize_acquisition_source(source),
+        max_age=60 * 60 * 24 * 30,
+        secure=True,
+        httponly=True,
+        samesite='Lax',
+    )
+    return response
+
+
+def safe_acquisition_event(event_type, source, reference=None):
+    try:
+        record_acquisition_event(event_type, source, reference=reference)
+    except DatabaseError:
+        # Analytics must never block checkout, claim, or API service.
+        pass
 
 
 def detect_anomaly(agent_output):
@@ -75,44 +154,321 @@ def purchase_credits_from_session(session):
 
 @app.route("/")
 def home():
+    source = referrer_source()
+    bot = is_probable_bot()
+    safe_acquisition_event('crawler_hit' if bot else 'landing_view', source)
+    buy_url = f"/go/{source}" if PAYMENT_LINK_URL else ""
+    schema_json = json.dumps({
+        "@context": "https://schema.org",
+        "@type": "SoftwareApplication",
+        "name": "Aeon Agent Output Anomaly Detector",
+        "applicationCategory": "DeveloperApplication",
+        "operatingSystem": "Web API",
+        "url": PUBLIC_BASE_URL + "/",
+        "description": (
+            "Deterministic API guardrail for AI-agent outputs: empty output, "
+            "oversized output, and error-keyword detection with prepaid usage credits."
+        ),
+        "offers": {
+            "@type": "Offer",
+            "price": str(UNIT_PRICE_USD),
+            "priceCurrency": "USD",
+            "description": "Per detection event",
+        },
+    })
     buy_html = (
-        f'<p><a href="{html.escape(PAYMENT_LINK_URL, quote=True)}">Buy prepaid API credits</a></p>'
-        if PAYMENT_LINK_URL
-        else "<p>Purchasing is temporarily unavailable.</p>"
+        f'<a class="cta" href="{html.escape(buy_url, quote=True)}">Buy API credits</a>'
+        if buy_url
+        else '<span class="cta disabled">Purchasing temporarily unavailable</span>'
     )
-
-    return f"""
+    body = f"""
     <!doctype html>
     <html lang="en">
       <head>
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>Aeon — Agent Output Anomaly Detector</title>
+        <title>AI Agent Output Anomaly Detector API | Aeon</title>
+        <meta name="description" content="Deterministic AI-agent output guardrail API for catching empty, oversized, and error-containing agent responses before downstream automation consumes them.">
+        <meta name="robots" content="index,follow,max-image-preview:large,max-snippet:-1">
+        <link rel="canonical" href="{PUBLIC_BASE_URL}/">
+        <link rel="alternate" type="application/json" href="{PUBLIC_BASE_URL}/openapi.json" title="OpenAPI">
+        <link rel="alternate" type="text/plain" href="{PUBLIC_BASE_URL}/llms.txt" title="LLM discovery">
+        <meta property="og:title" content="Aeon Agent Output Anomaly Detector API">
+        <meta property="og:description" content="A deterministic, machine-facing guardrail for AI-agent outputs. $0.003 per detection event.">
+        <meta property="og:type" content="website">
+        <meta property="og:url" content="{PUBLIC_BASE_URL}/">
+        <script type="application/ld+json">{schema_json}</script>
         <style>
-          body {{font-family: Arial, sans-serif; max-width: 820px; margin: 60px auto; padding: 0 24px; line-height: 1.6;}}
-          code, pre {{background: #f3f3f3; border-radius: 5px;}}
-          code {{padding: 3px 6px;}}
-          pre {{padding: 14px; overflow-x: auto;}}
+          :root {{ color-scheme: dark; }}
+          body {{ margin:0; font-family:Inter,system-ui,Arial,sans-serif; background:#071018; color:#eafaff; }}
+          main {{ max-width:980px; margin:0 auto; padding:64px 24px 80px; }}
+          .eyebrow {{ color:#63e6be; font-weight:800; letter-spacing:.08em; text-transform:uppercase; }}
+          h1 {{ font-size:clamp(38px,7vw,72px); line-height:1.02; margin:10px 0 18px; max-width:900px; }}
+          .lead {{ font-size:20px; color:#b8cad5; max-width:780px; line-height:1.6; }}
+          .actions {{ display:flex; flex-wrap:wrap; gap:12px; margin:28px 0 34px; }}
+          .cta {{ display:inline-block; padding:13px 18px; border-radius:10px; background:#63e6be; color:#04100d; font-weight:900; text-decoration:none; }}
+          .secondary {{ background:#142632; color:#d9f7ff; }}
+          .disabled {{ opacity:.55; }}
+          .grid {{ display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px; margin:28px 0; }}
+          .card {{ border:1px solid #24404f; background:#0b1922; border-radius:12px; padding:18px; }}
+          .card b {{ display:block; margin-bottom:6px; }}
+          code,pre {{ font-family:ui-monospace,SFMono-Regular,Consolas,monospace; }}
+          pre {{ overflow:auto; padding:16px; border:1px solid #24404f; background:#061018; border-radius:10px; color:#c9f6ff; }}
+          a {{ color:#71ddff; }}
+          .fine {{ color:#7f98a6; font-size:13px; line-height:1.5; }}
+          @media(max-width:760px) {{ .grid {{ grid-template-columns:1fr; }} }}
         </style>
       </head>
       <body>
-        <h1>Aeon</h1>
-        <h2>Agent Output Anomaly Detector</h2>
-        <p>A machine-facing API for detecting malformed, empty, excessively large, or error-containing AI-agent outputs.</p>
-        <h3>Pricing</h3>
-        <p>${UNIT_PRICE_USD} per detection event, sold as prepaid credits.</p>
-        {buy_html}
-        <h3>API</h3>
-        <p><code>POST /detect</code></p>
-        <pre>{{
-  "output": "Agent response here",
-  "event_id": "unique-client-event-id"
-}}</pre>
-        <p>Authenticate with <code>Authorization: Bearer YOUR_AEON_API_KEY</code>.</p>
-        <p><a href="/health">Service health</a></p>
+        <main>
+          <div class="eyebrow">AI-agent output guardrail API</div>
+          <h1>Stop broken agent outputs before they break the next step.</h1>
+          <p class="lead">Aeon provides a deterministic, low-cost validation endpoint for autonomous workflows. Catch empty responses, runaway output size, and explicit error signals before downstream tools, databases, or agents consume them.</p>
+          <div class="actions">
+            {buy_html}
+            <a class="cta secondary" href="/docs?src={source}">Read API docs</a>
+            <a class="cta secondary" href="/openapi.json">OpenAPI 3.1</a>
+          </div>
+          <div class="grid">
+            <div class="card"><b>Deterministic</b>No model call is needed for the current checks, so results are fast and repeatable.</div>
+            <div class="card"><b>Agent-ready</b>Bearer-key API, idempotent event IDs, OpenAPI, llms.txt, and agent discovery metadata.</div>
+            <div class="card"><b>Usage priced</b>${UNIT_PRICE_USD} per detection event through prepaid credits. No recurring human fulfillment loop.</div>
+          </div>
+          <h2>One request</h2>
+          <pre>curl -X POST {PUBLIC_BASE_URL}/detect \\
+  -H "Authorization: Bearer YOUR_AEON_API_KEY" \\
+  -H "Content-Type: application/json" \\
+  -d '{{"output":"Agent response here","event_id":"run-001"}}'</pre>
+          <h2>Designed for</h2>
+          <div class="grid">
+            <div class="card"><b>Agent pipelines</b>Gate model/tool output before another autonomous step executes.</div>
+            <div class="card"><b>CI and regression checks</b>Add a cheap deterministic sanity layer around agent-generated artifacts.</div>
+            <div class="card"><b>Workflow reliability</b>Use stable event IDs so retries do not double-consume credits.</div>
+          </div>
+          <p class="fine">The current detector is intentionally narrow: empty output, outputs above 10,000 characters, and outputs containing the word ERROR. The public telemetry never exposes customer emails, API keys, Stripe secrets, or database credentials.</p>
+          <p><a href="/health">Health</a> · <a href="/docs?src={source}">Docs</a> · <a href="/openapi.json">OpenAPI</a> · <a href="/llms.txt">llms.txt</a> · <a href="/agents.json">agents.json</a></p>
+        </main>
       </body>
     </html>
     """
+    response = make_response(body)
+    if not bot:
+        set_source_cookie(response, source)
+    response.headers['Cache-Control'] = 'no-store'
+    return response
+
+
+@app.route("/docs")
+def docs():
+    source = referrer_source()
+    bot = is_probable_bot()
+    safe_acquisition_event('crawler_hit' if bot else 'docs_view', source)
+    body = f"""
+    <!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>Aeon API Documentation</title><meta name="description" content="Documentation for the Aeon Agent Output Anomaly Detector API.">
+    <style>body{{font-family:system-ui,Arial,sans-serif;max-width:900px;margin:50px auto;padding:0 22px;line-height:1.65}}pre{{padding:14px;background:#f3f5f6;overflow:auto}}code{{font-family:ui-monospace,Consolas,monospace}}</style></head><body>
+    <h1>Aeon Agent Output Anomaly Detector API</h1>
+    <p>Base URL: <code>{PUBLIC_BASE_URL}</code></p>
+    <p>Price: <strong>${UNIT_PRICE_USD} per detection event</strong> through prepaid credits.</p>
+    <h2>Authentication</h2><p>Use <code>Authorization: Bearer YOUR_AEON_API_KEY</code>.</p>
+    <h2>POST /detect</h2>
+    <pre>curl -X POST {PUBLIC_BASE_URL}/detect \\
+  -H "Authorization: Bearer YOUR_AEON_API_KEY" \\
+  -H "Content-Type: application/json" \\
+  -d '{{"output":"Hello world","event_id":"example-001"}}'</pre>
+    <p>Each new event ID consumes one credit. Repeating the same event ID is idempotent and does not consume another credit.</p>
+    <h2>GET /usage</h2><p>Returns remaining credits and usage for the authenticated key.</p>
+    <h2>Detection rules</h2><ul><li>empty output</li><li>output longer than 10,000 characters</li><li>output containing the word <code>ERROR</code>, case-insensitive</li></ul>
+    <h2>Machine-readable discovery</h2><p><a href="/openapi.json">OpenAPI 3.1</a> · <a href="/llms.txt">llms.txt</a> · <a href="/agents.txt">agents.txt</a> · <a href="/agents.json">agents.json</a></p>
+    <p><a href="/go/{source}">Buy prepaid credits</a> · <a href="/">Home</a></p>
+    </body></html>
+    """
+    response = make_response(body)
+    if not bot:
+        set_source_cookie(response, source)
+    return response
+
+
+@app.route("/go/<source>")
+def acquisition_go(source):
+    source = normalize_acquisition_source(source)
+    if not PAYMENT_LINK_URL:
+        return jsonify({"error": "payment_link_not_configured"}), 503
+    if not is_probable_bot():
+        safe_acquisition_event('checkout_click', source)
+    response = redirect(PAYMENT_LINK_URL, code=302)
+    set_source_cookie(response, source)
+    response.headers['Cache-Control'] = 'no-store'
+    return response
+
+
+@app.route("/openapi.json")
+def openapi_spec():
+    return jsonify({
+        "openapi": "3.1.0",
+        "info": {
+            "title": "Aeon Agent Output Anomaly Detector API",
+            "version": "1.0.0",
+            "description": "Deterministic guardrail API for AI-agent outputs.",
+        },
+        "servers": [{"url": PUBLIC_BASE_URL}],
+        "paths": {
+            "/health": {
+                "get": {"operationId": "health", "summary": "Service and database health", "responses": {"200": {"description": "Healthy"}}}
+            },
+            "/detect": {
+                "post": {
+                    "operationId": "detectAgentOutputAnomaly",
+                    "summary": "Detect basic anomalies in an AI-agent output",
+                    "security": [{"bearerAuth": []}],
+                    "requestBody": {
+                        "required": True,
+                        "content": {"application/json": {"schema": {
+                            "type": "object",
+                            "required": ["output"],
+                            "properties": {
+                                "output": {"type": "string"},
+                                "event_id": {"type": "string", "description": "Idempotency key for one billable event"},
+                            },
+                        }}},
+                    },
+                    "responses": {
+                        "200": {"description": "Detection result and remaining credits"},
+                        "401": {"description": "Missing or invalid API key"},
+                        "402": {"description": "Insufficient prepaid credits"},
+                        "409": {"description": "Event ID belongs to a different customer"},
+                    },
+                }
+            },
+            "/usage": {
+                "get": {
+                    "operationId": "getUsage",
+                    "summary": "Get authenticated usage and remaining credits",
+                    "security": [{"bearerAuth": []}],
+                    "responses": {"200": {"description": "Usage summary"}},
+                }
+            },
+        },
+        "components": {
+            "securitySchemes": {
+                "bearerAuth": {"type": "http", "scheme": "bearer"}
+            }
+        },
+    })
+
+
+@app.route("/llms.txt")
+def llms_txt():
+    text = f"""# Aeon Agent Output Anomaly Detector\n\n> Deterministic, machine-facing API for detecting basic AI-agent output anomalies before downstream automation consumes them.\n\n## Core URLs\n- Home: {PUBLIC_BASE_URL}/\n- Docs: {PUBLIC_BASE_URL}/docs\n- OpenAPI: {PUBLIC_BASE_URL}/openapi.json\n- Health: {PUBLIC_BASE_URL}/health\n- Purchase credits: {PUBLIC_BASE_URL}/go/llms\n\n## API\n- POST /detect — authenticated anomaly detection; one prepaid credit per new event_id.\n- GET /usage — authenticated remaining credits and usage.\n\n## Current deterministic checks\n- empty output\n- output longer than 10,000 characters\n- output containing ERROR, case-insensitive\n\n## Pricing\n${UNIT_PRICE_USD} per detection event through prepaid credits.\n"""
+    return Response(text, mimetype='text/plain')
+
+
+@app.route("/agents.txt")
+def agents_txt():
+    text = f"""# Aeon\nSITE: {PUBLIC_BASE_URL}/\nOPENAPI: {PUBLIC_BASE_URL}/openapi.json\nLLMS: {PUBLIC_BASE_URL}/llms.txt\nPAYMENTS: {PUBLIC_BASE_URL}/go/agents\nAUTH: Bearer API key after prepaid-credit purchase\nCAPABILITY: deterministic AI-agent output anomaly detection\n"""
+    return Response(text, mimetype='text/plain')
+
+
+@app.route("/agents.json")
+def agents_json():
+    return jsonify({
+        "version": "1.0",
+        "site": {"name": "Aeon Agent Output Anomaly Detector", "url": PUBLIC_BASE_URL + "/"},
+        "capabilities": [{
+            "name": "agent_output_anomaly_detection",
+            "description": "Detect empty, oversized, or ERROR-containing agent outputs.",
+            "openapi": PUBLIC_BASE_URL + "/openapi.json",
+            "docs": PUBLIC_BASE_URL + "/docs",
+        }],
+        "payments": {"purchase_url": PUBLIC_BASE_URL + "/go/agents"},
+    })
+
+
+@app.route("/.well-known/api-catalog")
+def api_catalog():
+    return jsonify({
+        "schema": "aeon.api_catalog.v1",
+        "name": "Aeon Agent Output Anomaly Detector",
+        "homepage": PUBLIC_BASE_URL + "/",
+        "docs": PUBLIC_BASE_URL + "/docs",
+        "openapi": PUBLIC_BASE_URL + "/openapi.json",
+        "llms": PUBLIC_BASE_URL + "/llms.txt",
+        "agents": PUBLIC_BASE_URL + "/agents.json",
+        "health": PUBLIC_BASE_URL + "/health",
+    })
+
+
+@app.route("/robots.txt")
+def robots_txt():
+    return Response(
+        f"User-agent: *\\nAllow: /\\nSitemap: {PUBLIC_BASE_URL}/sitemap.xml\\n",
+        mimetype='text/plain',
+    )
+
+
+@app.route("/sitemap.xml")
+def sitemap_xml():
+    urls = ["/", "/docs", "/openapi.json", "/llms.txt", "/agents.txt", "/agents.json"]
+    items = ''.join(f'<url><loc>{PUBLIC_BASE_URL}{path}</loc></url>' for path in urls)
+    return Response(
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+        + items + '</urlset>',
+        mimetype='application/xml',
+    )
+
+
+@app.route(f"/{INDEXNOW_KEY}.txt")
+def indexnow_key_file():
+    return Response(INDEXNOW_KEY, mimetype='text/plain')
+
+
+@app.route("/aeon/acquisition")
+def aeon_acquisition():
+    try:
+        metrics = get_acquisition_metrics()
+    except DatabaseError:
+        return jsonify({
+            "schema": "aeon.acquisition_metrics.v1",
+            "status": "degraded",
+            "as_of": datetime.now(timezone.utc).isoformat(),
+            "funnel": {},
+            "sources": [],
+            "error": "metrics_query_failed",
+        }), 200
+
+    funnel = {
+        "landing_views": metrics["landing_views"],
+        "docs_views": metrics["docs_views"],
+        "checkout_clicks": metrics["checkout_clicks"],
+        "live_paid_checkouts": metrics["live_paid_checkouts"],
+        "live_paid_gross_usd": metrics["live_paid_gross_usd"],
+        "api_key_claims": metrics["api_key_claims"],
+        "crawler_hits": metrics["crawler_hits"],
+        "tracked_click_to_paid_rate": metrics["tracked_click_to_paid_rate"],
+    }
+    return jsonify({
+        "schema": "aeon.acquisition_metrics.v1",
+        "status": "healthy",
+        "as_of": datetime.now(timezone.utc).isoformat(),
+        "funnel": funnel,
+        "sources": metrics["sources"],
+        "last_event_at": metrics["last_event_at"],
+        "discovery_surfaces": [
+            PUBLIC_BASE_URL + "/sitemap.xml",
+            PUBLIC_BASE_URL + "/openapi.json",
+            PUBLIC_BASE_URL + "/llms.txt",
+            PUBLIC_BASE_URL + "/agents.txt",
+            PUBLIC_BASE_URL + "/agents.json",
+            PUBLIC_BASE_URL + "/.well-known/api-catalog",
+        ],
+        "truth_semantics": (
+            "LANDING_AND_CLICK_COUNTS_EXCLUDE_RECOGNIZED_BOTS; "
+            "PAID_CHECKOUTS_ARE_STRIPE_SIGNED LIVE PAID PURCHASES; "
+            "SOURCE_ATTRIBUTION_IS FIRST-PARTY COOKIE/REDIRECT ATTRIBUTION AND MAY BE UNATTRIBUTED; "
+            "NO_IPS_PII_OR_CREDENTIALS_RETURNED"
+        ),
+    })
 
 
 @app.route("/health")
@@ -328,6 +684,12 @@ def claim():
             return Response("<h1>Payment confirmation is still arriving.</h1><p>Wait a few seconds and refresh.</p>", status=202, mimetype="text/html")
         if state["payment_status"] != "paid":
             return Response("<h1>Your payment is not confirmed as paid yet.</h1>", status=202, mimetype="text/html")
+        source = normalize_acquisition_source(request.cookies.get(ACQUISITION_COOKIE) or 'direct')
+        try:
+            attribute_purchase_source(session_id, source)
+            record_acquisition_event('paid_return', source, reference=session_id)
+        except DatabaseError:
+            pass
         if state["claimed"]:
             return Response("<h1>This purchase was already claimed.</h1><p>For security, API keys are shown only once.</p>", status=409, mimetype="text/html")
 
@@ -356,6 +718,9 @@ def claim():
         return Response("<h1>This purchase was already claimed.</h1><p>For security, API keys are shown only once.</p>", status=409, mimetype="text/html")
     except DatabaseError:
         return Response("<h1>The billing database is temporarily unavailable.</h1>", status=503, mimetype="text/html")
+
+    source = normalize_acquisition_source(request.cookies.get(ACQUISITION_COOKIE) or 'direct')
+    safe_acquisition_event('api_key_claim', source, reference=session_id)
 
     api_key = html.escape(claimed["api_key"])
     email = html.escape(claimed["email"] or "Stripe customer")

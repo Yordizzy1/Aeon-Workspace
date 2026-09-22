@@ -543,3 +543,238 @@ def get_public_business_metrics():
         if isinstance(exc, DatabaseError):
             raise
         raise DatabaseError(str(exc)) from exc
+
+
+
+def ensure_acquisition_schema():
+    """Create additive acquisition tables/columns without touching billing truth."""
+    statements = [
+        """
+        CREATE TABLE IF NOT EXISTS acquisition_events (
+            id BIGSERIAL PRIMARY KEY,
+            event_type TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT 'direct',
+            reference TEXT,
+            occurred_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS acquisition_events_reference_uq
+        ON acquisition_events (event_type, reference)
+        WHERE reference IS NOT NULL
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS acquisition_events_time_idx
+        ON acquisition_events (occurred_at DESC)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS acquisition_events_source_idx
+        ON acquisition_events (source, event_type)
+        """,
+        """
+        ALTER TABLE purchases
+        ADD COLUMN IF NOT EXISTS acquisition_source TEXT
+        """,
+    ]
+    try:
+        with _connect() as conn:
+            with conn.cursor() as cur:
+                for statement in statements:
+                    cur.execute(statement)
+            conn.commit()
+    except Exception as exc:
+        if isinstance(exc, DatabaseError):
+            raise
+        raise DatabaseError(str(exc)) from exc
+
+
+def record_acquisition_event(event_type, source='direct', reference=None):
+    event_type = str(event_type or '').strip().lower()[:64]
+    source = str(source or 'direct').strip().lower()[:64] or 'direct'
+    reference = str(reference or '').strip()[:255] or None
+    if not event_type:
+        return False
+    try:
+        with _connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO acquisition_events (event_type, source, reference)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT DO NOTHING
+                    RETURNING id
+                    """,
+                    (event_type, source, reference),
+                )
+                inserted = cur.fetchone() is not None
+            conn.commit()
+        return inserted
+    except Exception as exc:
+        if isinstance(exc, DatabaseError):
+            raise
+        raise DatabaseError(str(exc)) from exc
+
+
+def attribute_purchase_source(session_id, source):
+    session_id = str(session_id or '').strip()
+    source = str(source or 'direct').strip().lower()[:64] or 'direct'
+    if not session_id:
+        return False
+    try:
+        with _connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE purchases
+                    SET acquisition_source = CASE
+                        WHEN acquisition_source IS NULL OR acquisition_source = ''
+                        THEN %s
+                        ELSE acquisition_source
+                    END,
+                    updated_at = NOW()
+                    WHERE stripe_session_id = %s
+                    RETURNING id
+                    """,
+                    (source, session_id),
+                )
+                updated = cur.fetchone() is not None
+            conn.commit()
+        return updated
+    except Exception as exc:
+        if isinstance(exc, DatabaseError):
+            raise
+        raise DatabaseError(str(exc)) from exc
+
+
+def get_acquisition_metrics():
+    """Aggregate source/funnel telemetry; never returns PII, IPs, or credentials."""
+    try:
+        with _connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT event_type, COUNT(*) AS count, MAX(occurred_at) AS last_at
+                    FROM acquisition_events
+                    GROUP BY event_type
+                    """
+                )
+                event_rows = cur.fetchall()
+
+                cur.execute(
+                    """
+                    SELECT source, event_type, COUNT(*) AS count
+                    FROM acquisition_events
+                    WHERE event_type IN (
+                        'landing_view', 'docs_view', 'checkout_click',
+                        'paid_return', 'api_key_claim', 'crawler_hit'
+                    )
+                    GROUP BY source, event_type
+                    """
+                )
+                source_events = cur.fetchall()
+
+                cur.execute(
+                    """
+                    SELECT
+                        COALESCE(NULLIF(acquisition_source, ''), 'unattributed') AS source,
+                        COUNT(*) AS paid_checkouts,
+                        COALESCE(SUM(amount_total), 0) AS paid_cents
+                    FROM purchases
+                    WHERE livemode = TRUE
+                      AND payment_status = 'paid'
+                    GROUP BY COALESCE(NULLIF(acquisition_source, ''), 'unattributed')
+                    """
+                )
+                paid_by_source = cur.fetchall()
+
+                cur.execute(
+                    """
+                    SELECT
+                        COUNT(*) AS paid_checkouts,
+                        COALESCE(SUM(amount_total), 0) AS paid_cents
+                    FROM purchases
+                    WHERE livemode = TRUE
+                      AND payment_status = 'paid'
+                    """
+                )
+                live_paid = cur.fetchone()
+
+        event_counts = {str(r['event_type']): int(r['count'] or 0) for r in event_rows}
+        last_candidates = [r['last_at'] for r in event_rows if r.get('last_at') is not None]
+        last_event_at = max(last_candidates).isoformat() if last_candidates else None
+
+        sources = {}
+        for row in source_events:
+            source = str(row['source'] or 'direct')
+            bucket = sources.setdefault(source, {
+                'source': source,
+                'landing_views': 0,
+                'docs_views': 0,
+                'checkout_clicks': 0,
+                'paid_returns': 0,
+                'api_key_claims': 0,
+                'crawler_hits': 0,
+                'paid_checkouts': 0,
+                'paid_gross_usd': 0.0,
+            })
+            key = {
+                'landing_view': 'landing_views',
+                'docs_view': 'docs_views',
+                'checkout_click': 'checkout_clicks',
+                'paid_return': 'paid_returns',
+                'api_key_claim': 'api_key_claims',
+                'crawler_hit': 'crawler_hits',
+            }.get(str(row['event_type']))
+            if key:
+                bucket[key] = int(row['count'] or 0)
+
+        for row in paid_by_source:
+            source = str(row['source'] or 'unattributed')
+            bucket = sources.setdefault(source, {
+                'source': source,
+                'landing_views': 0,
+                'docs_views': 0,
+                'checkout_clicks': 0,
+                'paid_returns': 0,
+                'api_key_claims': 0,
+                'crawler_hits': 0,
+                'paid_checkouts': 0,
+                'paid_gross_usd': 0.0,
+            })
+            bucket['paid_checkouts'] = int(row['paid_checkouts'] or 0)
+            bucket['paid_gross_usd'] = round(int(row['paid_cents'] or 0) / 100.0, 2)
+
+        source_list = sorted(
+            sources.values(),
+            key=lambda x: (
+                -int(x.get('paid_checkouts') or 0),
+                -int(x.get('checkout_clicks') or 0),
+                -int(x.get('landing_views') or 0),
+                str(x.get('source') or ''),
+            ),
+        )
+
+        clicks = int(event_counts.get('checkout_click', 0))
+        paid = int(live_paid['paid_checkouts'] or 0)
+        attributed_paid = sum(
+            int(row.get('paid_checkouts') or 0)
+            for row in source_list
+            if str(row.get('source') or '') != 'unattributed'
+        )
+        return {
+            'landing_views': int(event_counts.get('landing_view', 0)),
+            'docs_views': int(event_counts.get('docs_view', 0)),
+            'checkout_clicks': clicks,
+            'crawler_hits': int(event_counts.get('crawler_hit', 0)),
+            'paid_returns': int(event_counts.get('paid_return', 0)),
+            'api_key_claims': int(event_counts.get('api_key_claim', 0)),
+            'live_paid_checkouts': paid,
+            'live_paid_gross_usd': round(int(live_paid['paid_cents'] or 0) / 100.0, 2),
+            'tracked_click_to_paid_rate': round(attributed_paid / clicks, 6) if clicks else None,
+            'last_event_at': last_event_at,
+            'sources': source_list[:24],
+        }
+    except Exception as exc:
+        if isinstance(exc, DatabaseError):
+            raise
+        raise DatabaseError(str(exc)) from exc
